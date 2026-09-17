@@ -1,4 +1,4 @@
-# python .\DetecorMovePeople\soloWork\search.py .\DetecorMovePeople\Dataset\Originals\Originals\S003.avi --top-k 3
+# python soloWork\search.py .\soloWork\Dataset\BULGAKOV\00005.mp4 --top-k 3
 import argparse
 import numpy as np
 import cv2

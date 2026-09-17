@@ -9,11 +9,11 @@ model = YOLO("../yolov8n-pose.pt")
 
 store = VectorStore(dim=128)
 VIDEOS = [
-    f"Dataset/Originals/S0{("0" + str(i)) if i < 10 else i}.avi" for i in range(1, 45)
-    # f"Dataset/m1.mp4",
-    # f"Dataset/s1.mp4",
-    # f"Dataset/sh1.mp4",
+    # (f"Dataset/BULGAKOV/000{("0" + str(i)) if i < 10 else i}.mp4") for i in range(5, 16)
 ]
+for i in range(1, 11):
+    for j in range(5, 7):
+        VIDEOS.append(f"Dataset/BULGAKOV/Dataset2/val/0{("0" + str(i)) if i < 10 else i}-{j}.mp4")
 i = 0
 for path in VIDEOS:
     i += 1

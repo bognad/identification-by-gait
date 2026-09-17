@@ -5,8 +5,12 @@ from embeddings.video_embedder import build_sequence_embedding  # см. выше
 
 # Список (video_path, person_id)
 VIDEOS = [
-    (f"Dataset/Originals/S0{("0" + str(i)) if i < 10 else i}.avi", f"S_{i}") for i in range(1, 45)
+    # (f"Dataset/Originals/S0{("0" + str(i)) if i < 10 else i}.avi", f"S_{i}") for i in range(1, 45)
+    # (f"Dataset/BULGAKOV/000{("0" + str(i)) if i < 10 else i}.mp4", f"MP_{i}") for i in range(5, 16)
 ]
+for i in range(1, 11):
+    for j in range(1, 5):
+        VIDEOS.append((f"Dataset/BULGAKOV/Dataset2/train/0{("0" + str(i)) if i < 10 else i}-{j}.mp4", f"MP_{i}-{j}"))
 print(VIDEOS)
 def main():
     model = YOLO("../yolov8n-pose.pt")
@@ -31,11 +35,11 @@ def main():
         return
 
     np.savez(
-        "gait_sequences_41.npz",
+        "gait_sequences_41_BULG_2.npz",
         sequences=np.array(seqs, dtype=object),
         labels=np.array(labels),
     )
-    print("Сохранён gait_sequences_41.npz")
+    print("Сохранён gait_sequences_41_BULG.npz")
 
 if __name__ == "__main__":
     main()

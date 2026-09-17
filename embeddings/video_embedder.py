@@ -7,34 +7,42 @@ import torch
 from gait_model import GaitLSTM
 gait_model = GaitLSTM(input_dim=41, hidden_dim=128, emb_dim=128)
 gait_model.eval()
-def frame_embedding_enhanced(kps: np.ndarray) -> tuple[np.ndarray, dict]:
+def frame_embedding_enhanced(kps: np.ndarray,
+                             conf_thr: float = 0.5) -> tuple[np.ndarray, dict]:
     """
-    Эмбеддинг кадра:
-      - 26 относительных координат,
-      - 12 углов в суставах,
-      - 3 нормированные длины.
+    kps: np.ndarray shape (17, 3) или (N, 3) — (x, y, conf) для каждого keypoint.
     """
-    hip_center = (kps[11][:2] + kps[12][:2]) / 2.0
-    foot_center = (kps[15][:2] + kps[16][:2]) / 2.0
-    nose = kps[0][:2]
+    def safe_point(idx, fallback=None):
+        x, y, c = kps[idx]
+        if c > conf_thr and x > 0 and y > 0:
+            return np.array([x, y], dtype=np.float32)
+        if fallback is not None:
+            return fallback
+        return np.array([0.0, 0.0], dtype=np.float32)
 
-    # 26 относительных координат (нос + точки тела 5–16)
+    hip_center = (safe_point(11) + safe_point(12)) / 2.0
+    foot_center = (safe_point(15, hip_center) + safe_point(16, hip_center)) / 2.0
+    nose = safe_point(0, hip_center)
+
     ids = [0] + list(range(5, 17))
     coords_26 = []
     for idx in ids:
-        x_i, y_i, _ = kps[idx]
-        dx = x_i - hip_center[0]
-        dy = y_i - hip_center[1]
+        p = safe_point(idx, hip_center)
+        dx = p[0] - hip_center[0]
+        dy = p[1] - hip_center[1]
         coords_26.extend([dx, dy])
 
     height_approx = np.linalg.norm(nose - foot_center) + 1e-6
     coords_26 = np.array(coords_26, dtype=np.float32) / height_approx
 
-    # 12 углов
-    def angle_3pt(a, b, c):
+    def angle_3pt(a_idx, b_idx, c_idx):
+        a = safe_point(a_idx)
+        b = safe_point(b_idx)
+        c = safe_point(c_idx)
         ba = a - b
         bc = c - b
-        cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+        denom = (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+        cosine = np.dot(ba, bc) / denom
         return np.arccos(np.clip(cosine, -1.0, 1.0))
 
     angle_keys = [
@@ -47,34 +55,26 @@ def frame_embedding_enhanced(kps: np.ndarray) -> tuple[np.ndarray, dict]:
     ]
 
     angle_vals = np.array([
-        # локти
-        angle_3pt(kps[5][:2], kps[7][:2], kps[9][:2]),
-        angle_3pt(kps[6][:2], kps[8][:2], kps[10][:2]),
-        # колени
-        angle_3pt(kps[11][:2], kps[13][:2], kps[15][:2]),
-        angle_3pt(kps[12][:2], kps[14][:2], kps[16][:2]),
-        # бёдра
-        angle_3pt(hip_center, kps[11][:2], kps[13][:2]),
-        angle_3pt(hip_center, kps[12][:2], kps[14][:2]),
-        # плечи
-        angle_3pt(kps[5][:2], kps[11][:2], hip_center),
-        angle_3pt(kps[6][:2], kps[12][:2], hip_center),
-        # запястья
-        angle_3pt(kps[7][:2], kps[9][:2], kps[5][:2]),
-        angle_3pt(kps[8][:2], kps[10][:2], kps[6][:2]),
-        # голени
-        angle_3pt(kps[13][:2], kps[15][:2], foot_center),
-        angle_3pt(kps[14][:2], kps[16][:2], foot_center),
+        angle_3pt(5, 7, 9),
+        angle_3pt(6, 8, 10),
+        angle_3pt(11, 13, 15),
+        angle_3pt(12, 14, 16),
+        angle_3pt(11, 11, 13),
+        angle_3pt(12, 12, 14),
+        angle_3pt(5, 11, 11),
+        angle_3pt(6, 12, 12),
+        angle_3pt(7, 9, 5),
+        angle_3pt(8, 10, 6),
+        angle_3pt(13, 15, 15),
+        angle_3pt(14, 16, 16),
     ], dtype=np.float32)
 
-    # 3 нормированные длины
     leg_len = np.linalg.norm(foot_center - hip_center) / height_approx
     torso_len = np.linalg.norm(nose - hip_center) / height_approx
     height_norm = 1.0
 
     lengths = np.array([leg_len, torso_len, height_norm], dtype=np.float32)
-
-    emb = np.concatenate([coords_26, angle_vals, lengths])  # 26 + 12 + 3 = 41
+    emb = np.concatenate([coords_26, angle_vals, lengths])
 
     debug_info = {
         "angles": dict(zip(angle_keys, angle_vals)),
@@ -83,19 +83,11 @@ def frame_embedding_enhanced(kps: np.ndarray) -> tuple[np.ndarray, dict]:
         "height_norm": float(height_norm),
     }
     return emb, debug_info
-
 def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.ndarray:
-    """
-    Визуализация всего процесса:
-      - на каждом валидном кадре рисуем скелет,
-      - вычисляем признаки только когда лицо в зоне 25–75% по ширине окна,
-      - пробел: пауза/продолжить, ESC: выход,
-      - эмбеддинг = среднее по всем кадрам из рабочей зоны.
-    """
     WIN_W, WIN_H = 640, 480
     CONF_THR = 0.5
 
-    EMBEDS = []  # сюда эмбеддинги только из центральной зоны
+    EMBEDS = []
 
     cap = cv2.VideoCapture(video_path)
     paused = False
@@ -143,23 +135,6 @@ def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.
             kps = kps_all[0]
             conf = confs_all[0]
 
-            needed_ids = [0] + list(range(5, 17))
-            all_visible = True
-            for idx in needed_ids:
-                x, y, _ = kps[idx]
-                c = conf[idx]
-                if not (c > CONF_THR and x > 0 and y > 0):
-                    all_visible = False
-                    break
-
-            if not all_visible:
-                key = cv2.waitKey(1) & 0xFF if visualize else -1
-                if key == 27:
-                    break
-                if key == 32:
-                    paused = not paused
-                continue
-
             person_roi = frame[y1:y2, x1:x2].copy()
             if person_roi.size == 0:
                 key = cv2.waitKey(1) & 0xFF if visualize else -1
@@ -183,19 +158,17 @@ def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.
             kps_roi[:, 0] = (kps_roi[:, 0] - x1) * scale + offset_x
             kps_roi[:, 1] = (kps_roi[:, 1] - y1) * scale + offset_y
 
-            # координата носа в окне [0, WIN_W]
-            x_nose, y_nose, _ = kps_roi[0]
-            x_norm = x_nose / WIN_W  # [0, 1]
+            conf_roi = conf.copy()
 
+            x_nose, y_nose, _ = kps_roi[0]
+            x_norm = x_nose / WIN_W
             in_central_zone = (0.25 <= x_norm <= 0.75)
 
             if visualize:
-                # окно 1: человек + скелет
                 win1 = np.zeros((WIN_H, WIN_W, 3), dtype=np.uint8)
                 win1[offset_y:offset_y + person_scaled.shape[0],
                      offset_x:offset_x + person_scaled.shape[1]] = person_scaled.copy()
 
-                # окно 2: скелет + служебная инфа
                 win2 = np.zeros((WIN_H, WIN_W, 3), dtype=np.uint8)
 
                 def draw_skeleton(img, color=(0, 255, 0)):
@@ -209,38 +182,31 @@ def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.
                         xb, yb = kps_roi[b][0], kps_roi[b][1]
                         cv2.line(img, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 2)
 
-                # рисуем скелет на оба окна
                 draw_skeleton(win1)
                 draw_skeleton(win2)
 
-                # показываем зону 25–75% вертикальными линиями
                 cv2.line(win1, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
                 cv2.line(win1, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
                 cv2.line(win2, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
                 cv2.line(win2, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
 
-                # если кадр в рабочей зоне — считаем эмбеддинг и печатаем несколько чисел
                 if in_central_zone:
-                    emb, dbg = frame_embedding_enhanced(kps_roi)
-
-                    # краткий набор углов и длин для вывода
+                    emb, dbg = frame_embedding_enhanced(kps_roi, CONF_THR)
                     txts = [
-                        f"L_knee : {np.degrees(dbg['angles']['L_knee']):.1f}",  # (левое колено)
-                        f"R_knee : {np.degrees(dbg['angles']['R_knee']):.1f}", # (правое колено)
-                        f"L_hip  :   {np.degrees(dbg['angles']['L_hip']):.1f}", # (левое бедро)
-                        f"R_hip  :  {np.degrees(dbg['angles']['R_hip']):.1f}", # (правое бедро)
-                        f"L_elbow : {np.degrees(dbg['angles']['L_elbow']):.1f}", # (левый локоть)
-                        f"R_elbow : {np.degrees(dbg['angles']['R_elbow']):.1f}", # (правый локоть)
+                        f"L_knee : {np.degrees(dbg['angles']['L_knee']):.1f}",
+                        f"R_knee : {np.degrees(dbg['angles']['R_knee']):.1f}",
+                        f"L_hip  : {np.degrees(dbg['angles']['L_hip']):.1f}",
+                        f"R_hip  : {np.degrees(dbg['angles']['R_hip']):.1f}",
+                        f"L_elbow: {np.degrees(dbg['angles']['L_elbow']):.1f}",
+                        f"R_elbow: {np.degrees(dbg['angles']['R_elbow']):.1f}",
                         f"Leg length:   {dbg['leg_len']:.2f}",
                         f"Torso length: {dbg['torso_len']:.2f}",
                     ]
-
                     y0 = 20
                     dy = 18
                     for i, t in enumerate(txts):
                         cv2.putText(
-                            win2,
-                            t,
+                            win2, t,
                             (10, y0 + i * dy),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -259,23 +225,29 @@ def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.
                         1,
                         cv2.LINE_AA,
                     )
-                cv2.putText(win2, "[SPACE]=pause/resume, [ESC]=exit",
-                            (10, WIN_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (200, 200, 200), 1, cv2.LINE_AA)
+                cv2.putText(
+                    win2,
+                    "[SPACE]=pause/resume, [ESC]=exit",
+                    (10, WIN_H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 200, 200),
+                    1,
+                    cv2.LINE_AA,
+                )
 
                 cv2.imshow("Person + skeleton", win1)
                 cv2.imshow("Skeleton + debug", win2)
 
-            # добавляем эмбеддинг только если кадр в рабочей зоне
+            # добавляем эмбеддинг, даже если часть суставов с низким conf
             if in_central_zone:
-                emb, _ = frame_embedding_enhanced(kps_roi)
+                emb, _ = frame_embedding_enhanced(kps_roi, CONF_THR)
                 EMBEDS.append(emb)
 
-        # обработка клавиш
         key = cv2.waitKey(1) & 0xFF if visualize else -1
-        if key == 27:  # Esc
+        if key == 27:
             break
-        if key == 32:  # Space
+        if key == 32:
             paused = not paused
 
     cap.release()
@@ -286,14 +258,11 @@ def build_video_embedding(model, video_path: str, visualize: bool = True) -> np.
         return None
 
     EMBEDS = np.stack(EMBEDS, axis=0).astype(np.float32)  # (T, 41)
-
-    # Преобразуем в тензор PyTorch: batch=1
     x = torch.from_numpy(EMBEDS).unsqueeze(0)  # (1, T, 41)
 
     with torch.no_grad():
-        video_emb_torch = gait_model(x)  # (1, emb_dim)
-    video_embedding = video_emb_torch.cpu().numpy()[0]  # (emb_dim,)
-
+        video_emb_torch = gait_model(x)
+    video_embedding = video_emb_torch.cpu().numpy()[0]
     return video_embedding
 
 def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> np.ndarray:
@@ -352,23 +321,6 @@ def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> 
             kps = kps_all[0]
             conf = confs_all[0]
 
-            needed_ids = [0] + list(range(5, 17))
-            all_visible = True
-            for idx in needed_ids:
-                x, y, _ = kps[idx]
-                c = conf[idx]
-                if not (c > CONF_THR and x > 0 and y > 0):
-                    all_visible = False
-                    break
-
-            if not all_visible:
-                key = cv2.waitKey(1) & 0xFF if visualize else -1
-                if key == 27:
-                    break
-                if key == 32:
-                    paused = not paused
-                continue
-
             person_roi = frame[y1:y2, x1:x2].copy()
             if person_roi.size == 0:
                 key = cv2.waitKey(1) & 0xFF if visualize else -1
@@ -393,8 +345,9 @@ def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> 
             kps_roi[:, 1] = (kps_roi[:, 1] - y1) * scale + offset_y
 
             # координата носа в окне [0, WIN_W]
-            x_nose, y_nose, _ = kps_roi[0]
-            x_norm = x_nose / WIN_W  # [0, 1]
+            x_nose_orig, y_nose_orig, _ = kps[0]
+            frame_w = frame.shape[1]
+            x_norm = x_nose_orig / frame_w
 
             in_central_zone = (0.25 <= x_norm <= 0.75)
 
@@ -419,18 +372,27 @@ def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> 
                         cv2.line(img, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 2)
 
                 # рисуем скелет на оба окна
-                draw_skeleton(win1)
-                draw_skeleton(win2)
-
-                # показываем зону 25–75% вертикальными линиями
-                cv2.line(win1, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
-                cv2.line(win1, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
-                cv2.line(win2, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
-                cv2.line(win2, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
+                # draw_skeleton(win1)
+                # draw_skeleton(win2)
+                #
+                # # показываем зону 25–75% вертикальными линиями
+                # cv2.line(win1, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
+                # cv2.line(win1, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
+                # cv2.line(win2, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
+                # cv2.line(win2, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
 
                 # если кадр в рабочей зоне — считаем эмбеддинг и печатаем несколько чисел
                 if in_central_zone:
-                    emb, dbg = frame_embedding_enhanced(kps_roi)
+                    emb, dbg = frame_embedding_enhanced(kps_roi, CONF_THR)
+
+                    draw_skeleton(win1)
+                    draw_skeleton(win2)
+
+                    # показываем зону 25–75% вертикальными линиями
+                    cv2.line(win1, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
+                    cv2.line(win1, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
+                    cv2.line(win2, (int(0.25 * WIN_W), 0), (int(0.25 * WIN_W), WIN_H), (128, 128, 128), 1)
+                    cv2.line(win2, (int(0.75 * WIN_W), 0), (int(0.75 * WIN_W), WIN_H), (128, 128, 128), 1)
 
                     # краткий набор углов и длин для вывода
                     txts = [
@@ -477,7 +439,7 @@ def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> 
 
             # добавляем эмбеддинг только если кадр в рабочей зоне
             if in_central_zone:
-                emb, _ = frame_embedding_enhanced(kps_roi)
+                emb, dbg = frame_embedding_enhanced(kps_roi, CONF_THR)
                 EMBEDS.append(emb)
 
         # обработка клавиш
@@ -494,16 +456,24 @@ def build_sequence_embedding(model, video_path: str, visualize: bool = True) -> 
         print(f"Не удалось набрать кадры в рабочей зоне, video={video_path}")
         return None
 
-    EMBEDS = np.stack(EMBEDS, axis=0).astype(np.float32)  # (T, 41)
+    EMBEDS = np.stack(EMBEDS, axis=0).astype(np.float32)
     return EMBEDS
 
-gait_model = GaitLSTM(input_dim=41, hidden_dim=128, emb_dim=128, num_layers=1, num_classes=None)
+gait_model = GaitLSTM(input_dim=41, hidden_dim=128, emb_dim=128, num_layers=2, num_classes=None, bidirectional=False)
 state_dict = torch.load("gait_lstm.pth", map_location="cpu")
+# Проверка
+for k, v in gait_model.state_dict().items():
+    if "weight_ih_l0" in k:
+        print("Created model param:", k, v.shape)
+state_dict = torch.load("gait_lstm.pth", map_location="cpu")
+for k, v in state_dict.items():
+    if "weight_ih_l0" in k:
+        print("Checkpoint param:", k, v.shape)
 gait_model.load_state_dict({k: v for k, v in state_dict.items() if "fc_cls" not in k}, strict=False)
 gait_model.eval()
 
 def build_video_embedding_lstm(yolo_model, video_path: str) -> np.ndarray | None:
-    seq = build_sequence_embedding(yolo_model, video_path, visualize=False)  # (T, 41)
+    seq = build_sequence_embedding(yolo_model, video_path, visualize=True)  # (T, 41)
     if seq is None:
         return None
     x = torch.from_numpy(seq.astype(np.float32)).unsqueeze(0)  # (1, T, 41)
